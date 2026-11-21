@@ -41,7 +41,7 @@ fn alloc_mode() -> i32 {
     if m >= 0 {
         return m;
     }
-    let mut v = 0;
+    let mut v = 1; // default: huge pages for big buffers
     let p = unsafe { libc::getenv(b"SHOP_ALLOC\0".as_ptr() as *const libc::c_char) };
     if !p.is_null() {
         let c = unsafe { *p } as u8;
@@ -1626,6 +1626,13 @@ fn main() {
         let i = (eh >> (64 - dbits_log)) as usize;
         dbits[i >> 6] >> (i & 63) & 1 != 0
     };
+    let prefetch_dup = |eh: u64| {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let i = (eh >> (64 - dbits_log)) as usize;
+            std::arch::x86_64::_mm_prefetch(dbits.as_ptr().add(i >> 6) as *const i8, std::arch::x86_64::_MM_HINT_T0)
+        };
+    };
     log!(t0, "events pass 1: {} repeated ids", ndup);
 
     // validate a kept copy and resolve its person
@@ -1651,6 +1658,16 @@ fn main() {
             let c = task_lines(&ev_map, t);
             let mut out: Vec<Ev> = Vec::with_capacity(c.len() / 75 + 16);
             let mut dv: Vec<Vec<RawEv>> = (0..DB).map(|_| Vec::new()).collect();
+            // events wait in a short batch so the duplicate-bit lookups (a few MB, random) overlap
+            const BATCH: usize = 32;
+            let mut batch: Vec<RawEv> = Vec::with_capacity(BATCH);
+            let place = |e: &RawEv, out: &mut Vec<Ev>, dv: &mut Vec<Vec<RawEv>>| {
+                if maybe_dup(e.eh) {
+                    dv[(e.eh >> (64 - DB_BITS)) as usize].push(*e);
+                } else if let Some(v) = to_ev(e) {
+                    out.push(v);
+                }
+            };
             parse_lines::<7>(c, |&[eid, uid, ts, its, et, pid, pr]| {
                 if eid.is_empty() {
                     return;
@@ -1677,12 +1694,18 @@ fn main() {
                     cat: if kind == 2 { prod_cat.get(pid).unwrap_or(unknown) } else { 0 },
                     kind,
                 };
-                if maybe_dup(eh) {
-                    dv[(eh >> (64 - DB_BITS)) as usize].push(e);
-                } else if let Some(v) = to_ev(&e) {
-                    out.push(v);
+                prefetch_dup(eh);
+                batch.push(e);
+                if batch.len() == BATCH {
+                    for e in &batch {
+                        place(e, &mut out, &mut dv);
+                    }
+                    batch.clear();
                 }
             });
+            for e in &batch {
+                place(e, &mut out, &mut dv);
+            }
             people.resolve_all(&mut out, |e: &Ev| (e.ph, e.name), |e: &mut Ev, ph, name| {
                 e.ph = ph;
                 e.name = name;
