@@ -703,6 +703,49 @@ fn split_mut<'a, T>(mut v: &'a mut [T], starts: &[usize]) -> Vec<&'a mut [T]> {
 
 // ---------------- records ----------------
 
+/// A user or person ID kept inline when it is at most 15 bytes (zero padded, length in the last byte),
+/// otherwise a pointer and length (last byte 0xFF). Comparing two short names never touches the input.
+#[derive(Clone, Copy)]
+#[repr(C, align(8))]
+struct Name {
+    w: [u8; 16],
+}
+
+impl Name {
+    #[inline(always)]
+    fn new(s: S) -> Name {
+        let mut w = [0u8; 16];
+        let n = s.len();
+        if n <= 15 {
+            unsafe { std::ptr::copy_nonoverlapping(s.as_ptr(), w.as_mut_ptr(), n) };
+            w[15] = n as u8;
+        } else {
+            w[..8].copy_from_slice(&(s.as_ptr() as usize as u64).to_le_bytes());
+            w[8..12].copy_from_slice(&(n as u32).to_le_bytes());
+            w[15] = 0xFF;
+        }
+        Name { w }
+    }
+    #[inline(always)]
+    fn bytes(&self) -> &[u8] {
+        let t = self.w[15];
+        if t != 0xFF {
+            &self.w[..t as usize]
+        } else {
+            let p = u64::from_le_bytes(self.w[..8].try_into().unwrap()) as usize;
+            let n = u32::from_le_bytes(self.w[8..12].try_into().unwrap()) as usize;
+            unsafe { std::slice::from_raw_parts(p as *const u8, n) }
+        }
+    }
+    #[inline(always)]
+    fn same(&self, o: &Name) -> bool {
+        if u128::from_ne_bytes(self.w) == u128::from_ne_bytes(o.w) {
+            return true;
+        }
+        self.w[15] == 0xFF && o.w[15] == 0xFF && eq_bytes(self.bytes(), o.bytes())
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RawEv {
     eh: u64,
@@ -719,7 +762,7 @@ struct RawEv {
 #[derive(Clone, Copy)]
 struct Ev {
     ph: u64,
-    name: S,
+    name: Name,
     ts: i64,
     price: i32,
     cat: u16,
@@ -729,7 +772,7 @@ struct Ev {
 #[derive(Clone, Copy)]
 struct Click {
     ph: u64,
-    name: S,
+    name: Name,
     ts: i64,
     cid: S,
     camp: u16,
@@ -741,18 +784,13 @@ struct Click {
 struct PEntry {
     uh: u64,
     ph: u64,
-    name_ptr: usize,
-    name_len: u32,
+    name: Name,
     id_len: u32,
     id_ptr: usize,
     key: [u8; 16], // first bytes of id, so most lookups never leave this cache line
 }
 
 impl PEntry {
-    #[inline(always)]
-    fn name(&self) -> S {
-        unsafe { std::slice::from_raw_parts(self.name_ptr as *const u8, self.name_len as usize) }
-    }
     #[inline(always)]
     fn id(&self) -> S {
         unsafe { std::slice::from_raw_parts(self.id_ptr as *const u8, self.id_len as usize) }
@@ -768,7 +806,7 @@ struct People {
 
 impl People {
     #[inline]
-    fn resolve(&self, uh: u64, uid: S) -> (u64, S) {
+    fn resolve(&self, uh: u64, uid: &[u8]) -> Option<(u64, Name)> {
         if self.n > 0 {
             let mask = self.tab.len() - 1;
             let mut i = (uh >> self.shift) as usize;
@@ -781,13 +819,13 @@ impl People {
                     let n = uid.len();
                     let same = if n <= 16 { eq_bytes(&e.key[..n], uid) } else { eq_bytes(e.id(), uid) };
                     if same {
-                        return (e.ph, e.name());
+                        return Some((e.ph, e.name));
                     }
                 }
                 i = (i + 1) & mask;
             }
         }
-        (uh, uid)
+        None
     }
 
     #[inline(always)]
@@ -803,7 +841,7 @@ impl People {
 
     /// Resolve in place: on entry each item's (hash, name) holds the user ID's (hash, bytes).
     /// Table slots are prefetched a few items ahead so the cache misses overlap.
-    fn resolve_all<T>(&self, v: &mut [T], get: impl Fn(&T) -> (u64, S), set: impl Fn(&mut T, u64, S)) {
+    fn resolve_all<T>(&self, v: &mut [T], get: impl Fn(&T) -> (u64, &[u8]), set: impl Fn(&mut T, u64, Name)) {
         const AHEAD: usize = 16;
         let n = v.len();
         for i in 0..n.min(AHEAD) {
@@ -813,9 +851,13 @@ impl People {
             if i + AHEAD < n {
                 self.prefetch(get(&v[i + AHEAD]).0);
             }
-            let (uh, uid) = get(&v[i]);
-            let (ph, name) = self.resolve(uh, uid);
-            set(&mut v[i], ph, name);
+            let r = {
+                let (uh, uid) = get(&v[i]);
+                self.resolve(uh, uid)
+            };
+            if let Some((ph, name)) = r {
+                set(&mut v[i], ph, name);
+            }
         }
     }
 }
@@ -990,19 +1032,19 @@ fn people_table(names: &[S], uhs: &[u64], roots: &[u32], best: &[u32]) -> People
             PEntry {
                 uh: uhs[i],
                 ph: hash_bytes(name),
-                name_ptr: name.as_ptr() as usize,
-                name_len: name.len() as u32,
+                name: Name::new(name),
                 id_len: names[i].len() as u32,
                 id_ptr: names[i].as_ptr() as usize,
                 key,
             }
         })
         .collect();
-    // at most about 3/4 full
+    // at most about 3/8 full: an unlinked id (most lookups miss) then ends its probe within a line or two
     let mut cap = n.next_power_of_two().max(2);
     if n * 4 > cap * 3 {
         cap *= 2;
     }
+    cap *= 2;
     let bits = cap.trailing_zeros();
     let shift = 64 - bits;
     let mut entries = entries;
@@ -1094,7 +1136,7 @@ fn read_ref<const N: usize>(path: &Path) -> Vec<[S; N]> {
 // ---------------- outputs ----------------
 
 struct UserRow {
-    name: S,
+    name: Name,
     day: i32,
     sessions: i64,
     events: i64,
@@ -1129,7 +1171,22 @@ fn write_user(path: &Path, rows: &[&UserRow], cats: &[Vec<u8>]) {
         while let Some(mut c) = rg.next_column().unwrap() {
             match col {
                 0 => {
-                    let v: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.name.to_vec())).collect();
+                    // one shared buffer for all ids: no allocation per row
+                    let total: usize = rows.iter().map(|r| r.name.bytes().len()).sum();
+                    let mut buf = Vec::with_capacity(total);
+                    for r in rows {
+                        buf.extend_from_slice(r.name.bytes());
+                    }
+                    let buf = bytes::Bytes::from(buf);
+                    let mut off = 0;
+                    let v: Vec<ByteArray> = rows
+                        .iter()
+                        .map(|r| {
+                            let b = buf.slice(off..off + r.name.bytes().len());
+                            off += r.name.bytes().len();
+                            ByteArray::from(b)
+                        })
+                        .collect();
                     c.typed::<ByteArrayType>().write_batch(&v, None, None).unwrap();
                 }
                 1 => {
@@ -1148,11 +1205,12 @@ fn write_user(path: &Path, rows: &[&UserRow], cats: &[Vec<u8>]) {
                     c.typed::<Int64Type>().write_batch(&v, None, None).unwrap();
                 }
                 _ => {
+                    let cb: Vec<bytes::Bytes> = cats.iter().map(|c| bytes::Bytes::copy_from_slice(c)).collect();
                     let def: Vec<i16> = rows.iter().map(|r| (r.top != u16::MAX) as i16).collect();
                     let v: Vec<ByteArray> = rows
                         .iter()
                         .filter(|r| r.top != u16::MAX)
-                        .map(|r| ByteArray::from(cats[r.top as usize].clone()))
+                        .map(|r| ByteArray::from(cb[r.top as usize].clone()))
                         .collect();
                     c.typed::<ByteArrayType>().write_batch(&v, Some(&def), None).unwrap();
                 }
@@ -1223,7 +1281,7 @@ struct Acc {
     // grouping scratch, reused across buckets
     slot_id: Vec<u32>,
     p_ph: Vec<u64>,
-    p_name: Vec<S>,
+    p_name: Vec<Name>,
     p_slot: Vec<u32>,
     p_ecnt: Vec<u32>,
     p_ccnt: Vec<u32>,
@@ -1259,7 +1317,7 @@ impl Acc {
 }
 
 /// Sessions, credit and assists for one person: `ev` sorted by ts, `cl` sorted by (ts, click_id).
-fn process_person(acc: &mut Acc, ev: &[Ev], cl: &[Click], gname: S, cx: &Ctx) {
+fn process_person(acc: &mut Acc, ev: &[Ev], cl: &[Click], gname: Name, cx: &Ctx) {
     let Acc { rows, credit, assist, cnt, pos, active, catsum, touched, .. } = acc;
     let ndays = cx.ndays;
     let (mut lo, mut hi) = (0usize, 0usize);
@@ -1407,7 +1465,7 @@ fn group_bucket(acc: &mut Acc, evs: &[Ev], cls: &[Click], cx: &Ctx) -> bool {
             }
             s = (s + 1) & mask;
         };
-        if !eq_bytes(acc.p_name[id as usize], e.name) {
+        if !acc.p_name[id as usize].same(&e.name) {
             ok = false;
         }
         acc.p_ecnt[id as usize] += 1;
@@ -1430,7 +1488,7 @@ fn group_bucket(acc: &mut Acc, evs: &[Ev], cls: &[Click], cx: &Ctx) -> bool {
             s = (s + 1) & mask;
         };
         if id != u32::MAX {
-            if !eq_bytes(acc.p_name[id as usize], c.name) {
+            if !acc.p_name[id as usize].same(&c.name) {
                 ok = false;
             }
             acc.p_ccnt[id as usize] += 1;
@@ -1498,21 +1556,21 @@ fn group_bucket(acc: &mut Acc, evs: &[Ev], cls: &[Click], cx: &Ctx) -> bool {
 
 /// Exact path (used only when a person hash collides): sort by (hash, name, ts) and group by (hash, name).
 fn process_bucket_sorted(acc: &mut Acc, evs: &mut [Ev], cls: &mut [Click], cx: &Ctx) {
-    evs.sort_unstable_by(|a, b| a.ph.cmp(&b.ph).then(a.name.cmp(b.name)).then(a.ts.cmp(&b.ts)));
-    cls.sort_unstable_by(|a, b| a.ph.cmp(&b.ph).then(a.name.cmp(b.name)).then(a.ts.cmp(&b.ts)).then(a.cid.cmp(b.cid)));
+    evs.sort_unstable_by(|a, b| a.ph.cmp(&b.ph).then(a.name.bytes().cmp(b.name.bytes())).then(a.ts.cmp(&b.ts)));
+    cls.sort_unstable_by(|a, b| a.ph.cmp(&b.ph).then(a.name.bytes().cmp(b.name.bytes())).then(a.ts.cmp(&b.ts)).then(a.cid.cmp(b.cid)));
     let mut ci = 0usize;
     let mut i = 0usize;
     while i < evs.len() {
         let (kph, knm) = (evs[i].ph, evs[i].name);
         let mut gend = i + 1;
-        while gend < evs.len() && evs[gend].ph == kph && evs[gend].name == knm {
+        while gend < evs.len() && evs[gend].ph == kph && evs[gend].name.same(&knm) {
             gend += 1;
         }
-        while ci < cls.len() && (cls[ci].ph, cls[ci].name) < (kph, knm) {
+        while ci < cls.len() && (cls[ci].ph, cls[ci].name.bytes()) < (kph, knm.bytes()) {
             ci += 1;
         }
         let cs = ci;
-        while ci < cls.len() && cls[ci].ph == kph && cls[ci].name == knm {
+        while ci < cls.len() && cls[ci].ph == kph && cls[ci].name.same(&knm) {
             ci += 1;
         }
         process_person(acc, &evs[i..gend], &cls[cs..ci], knm, cx);
@@ -1566,15 +1624,12 @@ fn main() {
     let ncamp = camps.len();
     let organic = ncamp as u16;
 
-    // links
-    let people = build_people(&data);
-    log!(t0, "links: {} ids", people.n);
-
     // events: memory-mapped, parsed in parallel slices of each file
     let ev_map = map_files(&data.join("events"));
 
-    // pass 1: hash every event_id (first field only) to learn which ids occur more than once
-    let id_parts: Vec<Vec<Vec<u64>>> = ev_map
+    // links, and at the same time pass 1 over events: hash every event_id (first field only) to learn
+    // which ids occur more than once. The links work has serial steps; pass 1 fills the idle threads.
+    let (people, id_parts) = rayon::join(|| build_people(&data), || -> Vec<Vec<Vec<u64>>> { ev_map
         .tasks
         .par_iter()
         .map(|t| {
@@ -1596,8 +1651,11 @@ fn main() {
             });
             v
         })
-        .collect();
+        .collect() });
+    log!(t0, "links: {} ids; events pass 1 hashed", people.n);
     let id_parts = &id_parts;
+    // events (pass 2, dedup, bucketing) and clicks run side by side: each has serial steps the other fills
+    let ((mut evs_all, estarts), (mut cls_all, cstarts)) = rayon::join(|| {
     let dups: Vec<Vec<u64>> = (0..DB)
         .into_par_iter()
         .map(|b| {
@@ -1647,7 +1705,7 @@ fn main() {
             return None;
         }
         // person resolved later in batches: carry the user id's hash and bytes for now
-        Some(Ev { ph: e.uh, name: e.uid, ts: e.ts, price: e.price, cat: e.cat, purchase: e.kind == 2 })
+        Some(Ev { ph: e.uh, name: Name::new(e.uid), ts: e.ts, price: e.price, cat: e.cat, purchase: e.kind == 2 })
     };
 
     // pass 2: full parse. Events whose id occurs once are final right away; the rest go to exact dedup.
@@ -1706,7 +1764,7 @@ fn main() {
             for e in &batch {
                 place(e, &mut out, &mut dv);
             }
-            people.resolve_all(&mut out, |e: &Ev| (e.ph, e.name), |e: &mut Ev, ph, name| {
+            people.resolve_all(&mut out, |e: &Ev| (e.ph, e.name.bytes()), |e: &mut Ev, ph, name| {
                 e.ph = ph;
                 e.name = name;
             });
@@ -1757,7 +1815,7 @@ fn main() {
                         out.push(v);
                     }
                 }
-                people.resolve_all(&mut out[before..], |e: &Ev| (e.ph, e.name), |e: &mut Ev, ph, name| {
+                people.resolve_all(&mut out[before..], |e: &Ev| (e.ph, e.name.bytes()), |e: &mut Ev, ph, name| {
                     e.ph = ph;
                     e.name = name;
                 });
@@ -1772,8 +1830,10 @@ fn main() {
     }
     ev_parts.extend(dedup_out);
     log!(t0, "events deduped and cleaned");
-    let (mut evs_all, estarts) = scatter(ev_parts, PB, |e: &Ev| pbucket(e.ph));
+    let (evs_all, estarts) = scatter(ev_parts, PB, |e: &Ev| pbucket(e.ph));
     log!(t0, "events bucketed by person: {}", evs_all.len());
+    (evs_all, estarts)
+    }, || {
 
     // clicks (copies are identical, so duplicates change nothing and need no dedup)
     let cl_map = map_files(&data.join("clicks"));
@@ -1792,17 +1852,19 @@ fn main() {
                 if tm == BAD || tm < cws || tm >= we {
                     return;
                 }
-                v.push(Click { ph: hash_bytes(uid), name: uid, ts: tm, cid, camp: ci });
+                v.push(Click { ph: hash_bytes(uid), name: Name::new(uid), ts: tm, cid, camp: ci });
             });
-            people.resolve_all(&mut v, |c: &Click| (c.ph, c.name), |c: &mut Click, ph, name| {
+            people.resolve_all(&mut v, |c: &Click| (c.ph, c.name.bytes()), |c: &mut Click, ph, name| {
                 c.ph = ph;
                 c.name = name;
             });
             v
         })
         .collect();
-    let (mut cls_all, cstarts) = scatter(cl_parts, PB, |c: &Click| pbucket(c.ph));
+    let (cls_all, cstarts) = scatter(cl_parts, PB, |c: &Click| pbucket(c.ph));
     log!(t0, "clicks cleaned and bucketed: {}", cls_all.len());
+    (cls_all, cstarts)
+    });
 
     let ncat = catnames.len();
     let force_exact = std::env::var_os("SHOP_EXACT").is_some();
