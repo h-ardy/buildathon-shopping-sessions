@@ -645,61 +645,35 @@ fn read_manifest(data: &Path) -> (i64, i64) {
 
 // ---------------- scatter (counting sort by bucket) ----------------
 
-struct SendPtr<T>(*mut T);
-unsafe impl<T> Send for SendPtr<T> {}
-unsafe impl<T> Sync for SendPtr<T> {}
-
-fn scatter<T: Copy + Send + Sync, F: Fn(&T) -> usize + Sync>(parts: Vec<Vec<T>>, nb: usize, key: F) -> (Vec<T>, Vec<usize>) {
-    let counts: Vec<Vec<u32>> = parts
-        .par_iter()
-        .map(|p| {
-            let mut c = vec![0u32; nb];
-            for x in p {
-                c[key(x)] += 1;
+/// Bucket every part by key in place (through a reused scratch buffer, so no fresh memory per part).
+/// Returns, per part, the start of each bucket (nb + 1 entries). Order inside a bucket is kept.
+fn bucket_parts<T: Copy + Send + Sync, F: Fn(&T) -> usize + Sync>(parts: &mut [Vec<T>], nb: usize, key: F) -> Vec<Vec<u32>> {
+    parts
+        .par_iter_mut()
+        .map_init(Vec::<T>::new, |scratch, v| {
+            let mut cnt = vec![0u32; nb + 1];
+            for x in v.iter() {
+                cnt[key(x) + 1] += 1;
             }
-            c
-        })
-        .collect();
-    let mut starts = vec![0usize; nb + 1];
-    for b in 0..nb {
-        let s: usize = counts.iter().map(|c| c[b] as usize).sum();
-        starts[b + 1] = starts[b] + s;
-    }
-    let mut run = starts[..nb].to_vec();
-    let offs: Vec<Vec<usize>> = counts
-        .iter()
-        .map(|c| {
-            let o = run.clone();
             for b in 0..nb {
-                run[b] += c[b] as usize;
+                cnt[b + 1] += cnt[b];
             }
-            o
+            let mut w = cnt.clone();
+            scratch.clear();
+            scratch.reserve(v.len());
+            let dst = scratch.as_mut_ptr();
+            for x in v.iter() {
+                let b = key(x);
+                unsafe { dst.add(w[b] as usize).write(*x) };
+                w[b] += 1;
+            }
+            unsafe { scratch.set_len(v.len()) };
+            std::mem::swap(v, scratch);
+            cnt
         })
-        .collect();
-    let total = starts[nb];
-    let mut out: Vec<T> = Vec::with_capacity(total);
-    let ptr = SendPtr(out.as_mut_ptr());
-    let ptr = &ptr;
-    parts.into_par_iter().zip(offs.into_par_iter()).for_each(|(p, mut o)| {
-        for x in p {
-            let b = key(&x);
-            unsafe { ptr.0.add(o[b]).write(x) };
-            o[b] += 1;
-        }
-    });
-    unsafe { out.set_len(total) };
-    (out, starts)
+        .collect()
 }
 
-fn split_mut<'a, T>(mut v: &'a mut [T], starts: &[usize]) -> Vec<&'a mut [T]> {
-    let mut out = Vec::with_capacity(starts.len() - 1);
-    for w in starts.windows(2) {
-        let (a, b) = v.split_at_mut(w[1] - w[0]);
-        out.push(a);
-        v = b;
-    }
-    out
-}
 
 // ---------------- records ----------------
 
@@ -1655,7 +1629,7 @@ fn main() {
     log!(t0, "links: {} ids; events pass 1 hashed", people.n);
     let id_parts = &id_parts;
     // events (pass 2, dedup, bucketing) and clicks run side by side: each has serial steps the other fills
-    let ((mut evs_all, estarts), (mut cls_all, cstarts)) = rayon::join(|| {
+    let ((ev_parts, eoffs), (cl_parts, coffs)) = rayon::join(|| {
     let dups: Vec<Vec<u64>> = (0..DB)
         .into_par_iter()
         .map(|b| {
@@ -1830,14 +1804,14 @@ fn main() {
     }
     ev_parts.extend(dedup_out);
     log!(t0, "events deduped and cleaned");
-    let (evs_all, estarts) = scatter(ev_parts, PB, |e: &Ev| pbucket(e.ph));
-    log!(t0, "events bucketed by person: {}", evs_all.len());
-    (evs_all, estarts)
+    let eoffs = bucket_parts(&mut ev_parts, PB, |e: &Ev| pbucket(e.ph));
+    log!(t0, "events bucketed by person: {}", ev_parts.iter().map(|p| p.len()).sum::<usize>());
+    (ev_parts, eoffs)
     }, || {
 
     // clicks (copies are identical, so duplicates change nothing and need no dedup)
     let cl_map = map_files(&data.join("clicks"));
-    let cl_parts: Vec<Vec<Click>> = cl_map
+    let mut cl_parts: Vec<Vec<Click>> = cl_map
         .tasks
         .par_iter()
         .map(|t| {
@@ -1861,28 +1835,37 @@ fn main() {
             v
         })
         .collect();
-    let (cls_all, cstarts) = scatter(cl_parts, PB, |c: &Click| pbucket(c.ph));
-    log!(t0, "clicks cleaned and bucketed: {}", cls_all.len());
-    (cls_all, cstarts)
+    let coffs = bucket_parts(&mut cl_parts, PB, |c: &Click| pbucket(c.ph));
+    log!(t0, "clicks cleaned and bucketed: {}", cl_parts.iter().map(|p| p.len()).sum::<usize>());
+    (cl_parts, coffs)
     });
 
     let ncat = catnames.len();
     let force_exact = std::env::var_os("SHOP_EXACT").is_some();
     let ctx = Ctx { ndays, ws_day, organic };
-    let ev_slices = split_mut(&mut evs_all, &estarts);
-    let cl_slices = split_mut(&mut cls_all, &cstarts);
-    let results: Vec<Acc> = ev_slices
+    let (ev_parts, cl_parts) = (&ev_parts, &cl_parts);
+    let (eoffs, coffs) = (&eoffs, &coffs);
+    let results: Vec<Acc> = (0..PB)
         .into_par_iter()
-        .zip(cl_slices.into_par_iter())
         .fold(
-            || Acc::new(ncamp, ndays, ncat),
-            |mut acc, (evs, cls)| {
-                if force_exact || !group_bucket(&mut acc, evs, cls, &ctx) {
-                    process_bucket_sorted(&mut acc, evs, cls, &ctx);
+            || (Acc::new(ncamp, ndays, ncat), Vec::<Ev>::new(), Vec::<Click>::new()),
+            |(mut acc, mut ev, mut cl), b| {
+                // copy the bucket's pieces into one reused, cache-sized buffer
+                ev.clear();
+                for p in ev_parts.iter().zip(eoffs) {
+                    ev.extend_from_slice(&p.0[p.1[b] as usize..p.1[b + 1] as usize]);
                 }
-                acc
+                cl.clear();
+                for p in cl_parts.iter().zip(coffs) {
+                    cl.extend_from_slice(&p.0[p.1[b] as usize..p.1[b + 1] as usize]);
+                }
+                if force_exact || !group_bucket(&mut acc, &ev, &cl, &ctx) {
+                    process_bucket_sorted(&mut acc, &mut ev, &mut cl, &ctx);
+                }
+                (acc, ev, cl)
             },
         )
+        .map(|(acc, _, _)| acc)
         .collect();
     log!(t0, "sessions, credit and assists done");
 
