@@ -4,14 +4,14 @@ A native Rust pipeline that reads the dirty click-stream CSVs in `/data` and wri
 
 ## How it works
 
-1. Reading. Every CSV is cut into 8 MB slices. Each thread reads its own slice with `pread` and parses it straight away, so disk reads and parsing overlap. A slice owns the lines that start inside it, and finishes its last line by reading past its end.
+1. Reading. Every CSV is memory-mapped (no copy) and cut into 8 MB slices, which the threads parse in parallel. A slice owns the lines that start inside it and finishes its last line past its end. Each slice is faulted in with one `MADV_POPULATE_READ` call instead of one page fault per 4 KB.
 2. Lines. One AVX2 pass marks every comma, quote and newline (with a scalar fallback). A line is kept only with the exact field count and quotes around whole fields. `\r` is an ordinary character.
 3. Linked IDs. Link pairs go through union-find, and each person is named by the byte-wise smallest ID. An open-addressing table maps each linked ID to its person.
 4. Events. Records are bucketed by a hash of `event_id` with one counting sort. Each bucket keeps the copy with the earliest `ingest_ts`, and only then validates it (window, type, product, price, late cutoff). Hash collisions between different IDs are compared byte for byte.
 5. Sessions, credit and assists. Events and clicks are bucketed by person, then sorted by time. One pass per person builds the sessions, credits each session to the latest click within 7 days (smallest `click_id` on ties), and keeps a sliding 7-day window of campaign counts for assists.
 6. Output. `campaign_daily` is one file. `user_daily` is written as several files in parallel.
 
-Large buffers are mapped directly with `mmap`. That cuts allocator overhead on the several GB the run touches.
+Large buffers are mapped directly with `mmap`, and keys are compared inline rather than through library calls. Per-person grouping compares only the 64-bit person hash, and falls back to comparing names if two different names ever share a hash (`SHOP_EXACT=1` forces that path for testing).
 
 ## Checks
 

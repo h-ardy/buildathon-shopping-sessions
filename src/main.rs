@@ -138,6 +138,34 @@ macro_rules! log {
     }};
 }
 
+/// Byte equality without a library call (names and IDs are short).
+#[inline(always)]
+fn eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    if a.as_ptr() == b.as_ptr() {
+        return true;
+    }
+    let n = a.len();
+    let mut i = 0;
+    while i + 8 <= n {
+        let x = unsafe { (a.as_ptr().add(i) as *const u64).read_unaligned() };
+        let y = unsafe { (b.as_ptr().add(i) as *const u64).read_unaligned() };
+        if x != y {
+            return false;
+        }
+        i += 8;
+    }
+    while i < n {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 #[inline]
 fn hash_bytes(b: &[u8]) -> u64 {
     let mut h = FxHasher::default();
@@ -505,60 +533,78 @@ fn csv_files(dir: &Path) -> Vec<PathBuf> {
 
 struct Task {
     file: usize,
-    off: u64,
-    end: u64,
-    flen: u64,
+    off: usize,
+    end: usize,
 }
 
-fn tasks_for(files: &[PathBuf]) -> Vec<Task> {
-    let mut t = Vec::new();
-    for (i, p) in files.iter().enumerate() {
-        let flen = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+struct Mapped {
+    files: Vec<S>,
+    tasks: Vec<Task>,
+}
+
+/// Map every file read-only (no copy) and cut it into slices of about chunk_size() bytes.
+fn map_files(dir: &Path) -> Mapped {
+    let paths = csv_files(dir);
+    let files: Vec<S> = paths
+        .par_iter()
+        .map(|p| {
+            let f = std::fs::File::open(p).unwrap_or_else(|e| panic!("open {}: {}", p.display(), e));
+            let len = f.metadata().map(|m| m.len()).unwrap_or(0) as usize;
+            if len == 0 {
+                return &[][..];
+            }
+            use std::os::unix::io::AsRawFd;
+            let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0) };
+            if ptr == libc::MAP_FAILED {
+                // fall back to reading the file
+                let v = std::fs::read(p).unwrap_or_else(|e| panic!("read {}: {}", p.display(), e));
+                return &*Box::leak(v.into_boxed_slice());
+            }
+            unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }
+        })
+        .collect();
+    let cs = chunk_size() as usize;
+    let mut tasks = Vec::new();
+    for (i, b) in files.iter().enumerate() {
         let mut off = 0;
-        while off < flen {
-            let end = (off + chunk_size()).min(flen);
-            t.push(Task { file: i, off, end, flen });
+        while off < b.len() {
+            let end = (off + cs).min(b.len());
+            tasks.push(Task { file: i, off, end });
             off = end;
         }
     }
-    // biggest first helps the scheduler; order does not affect results
-    t
+    Mapped { files, tasks }
 }
 
-/// Read the lines owned by this task: those whose first byte lies in [off, end). The header (first line
-/// of the file) is skipped. Only \n ends a line.
-fn read_task(files: &[PathBuf], t: &Task) -> S {
-    use std::os::unix::fs::FileExt;
-    let f = std::fs::File::open(&files[t.file]).unwrap_or_else(|e| panic!("open {}: {}", files[t.file].display(), e));
-    let rs = if t.off > 0 { t.off - 1 } else { 0 };
-    let mut buf = vec![0u8; (t.end - rs) as usize];
-    f.read_exact_at(&mut buf, rs).expect("read");
-    if t.end < t.flen && buf.last() != Some(&b'\n') {
-        let mut pos = t.end;
-        loop {
-            let n = (64 * 1024).min(t.flen - pos) as usize;
-            if n == 0 {
-                break;
-            }
-            let old = buf.len();
-            buf.resize(old + n, 0);
-            f.read_exact_at(&mut buf[old..], pos).expect("read");
-            pos += n as u64;
-            if let Some(i) = memchr(b'\n', &buf[old..]) {
-                buf.truncate(old + i + 1);
-                break;
-            }
-        }
-    }
+/// The lines owned by this task: those whose first byte lies in [off, end). The header (first line of
+/// the file) is skipped. Only \n ends a line.
+fn task_lines(m: &Mapped, t: &Task) -> S {
+    let b = m.files[t.file];
     let start = if t.off == 0 {
-        memchr(b'\n', &buf).map(|i| i + 1).unwrap_or(buf.len())
-    } else if buf[0] == b'\n' {
-        1
+        memchr(b'\n', b).map(|i| i + 1).unwrap_or(b.len())
+    } else if b[t.off - 1] == b'\n' {
+        t.off
     } else {
-        memchr(b'\n', &buf).map(|i| i + 1).unwrap_or(buf.len())
+        memchr(b'\n', &b[t.off..]).map(|i| t.off + i + 1).unwrap_or(b.len())
     };
-    let b: S = Box::leak(buf.into_boxed_slice());
-    &b[start..]
+    let end = if t.end >= b.len() || b[t.end - 1] == b'\n' {
+        t.end
+    } else {
+        memchr(b'\n', &b[t.end..]).map(|i| t.end + i + 1).unwrap_or(b.len())
+    };
+    if start >= end {
+        return &[];
+    }
+    let s = &b[start..end];
+    #[cfg(target_os = "linux")]
+    unsafe {
+        // fault the slice in with one call instead of one page fault per 4 KB (Linux 5.14+; ignored if not)
+        let pg = 4096usize;
+        let a = (s.as_ptr() as usize) & !(pg - 1);
+        let len = s.as_ptr() as usize + s.len() - a;
+        libc::madvise(a as *mut libc::c_void, len, 22 /* MADV_POPULATE_READ */);
+    }
+    s
 }
 
 fn read_manifest(data: &Path) -> (i64, i64) {
@@ -694,13 +740,63 @@ impl People {
                 if e.id.is_empty() {
                     break;
                 }
-                if e.uh == uh && e.id == uid {
+                if e.uh == uh && eq_bytes(e.id, uid) {
                     return (e.ph, e.name);
                 }
                 i = (i + 1) & mask;
             }
         }
         (uh, uid)
+    }
+}
+
+/// Open-addressing map from short byte strings to a small value, compared without library calls.
+struct StrMap<V: Copy> {
+    tab: Vec<(u64, S, V)>,
+    shift: u32,
+    empty: V,
+}
+
+impl<V: Copy + PartialEq> StrMap<V> {
+    fn new(items: impl IntoIterator<Item = (S, V)>, empty: V) -> Self {
+        let items: Vec<(S, V)> = items.into_iter().collect();
+        let cap = (items.len() * 2).next_power_of_two().max(2);
+        let shift = 64 - cap.trailing_zeros();
+        let mut tab = vec![(0u64, &[][..], empty); cap];
+        let mut used = vec![false; cap];
+        for (k, v) in items {
+            let h = hash_bytes(k);
+            let mut i = (h >> shift) as usize;
+            loop {
+                if !used[i] {
+                    used[i] = true;
+                    tab[i] = (h, k, v);
+                    break;
+                }
+                if tab[i].0 == h && eq_bytes(tab[i].1, k) {
+                    tab[i].2 = v; // duplicate key: last one wins
+                    break;
+                }
+                i = (i + 1) & (cap - 1);
+            }
+        }
+        StrMap { tab, shift, empty }
+    }
+    #[inline]
+    fn get(&self, k: &[u8]) -> Option<V> {
+        let h = hash_bytes(k);
+        let mask = self.tab.len() - 1;
+        let mut i = (h >> self.shift) as usize;
+        loop {
+            let e = &self.tab[i];
+            if e.2 == self.empty {
+                return None;
+            }
+            if e.0 == h && eq_bytes(e.1, k) {
+                return Some(e.2);
+            }
+            i = (i + 1) & mask;
+        }
     }
 }
 
@@ -719,12 +815,12 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
 }
 
 fn build_people(data: &Path) -> People {
-    let files = csv_files(&data.join("links"));
-    let tasks = tasks_for(&files);
-    let pairs: Vec<Vec<(S, S)>> = tasks
+    let mp = map_files(&data.join("links"));
+    let pairs: Vec<Vec<(S, S)>> = mp
+        .tasks
         .par_iter()
         .map(|t| {
-            let c = read_task(&files, t);
+            let c = task_lines(&mp, t);
             let mut v = Vec::new();
             parse_lines::<2>(c, |&[a, b]| {
                 if !a.is_empty() && !b.is_empty() {
@@ -935,10 +1031,10 @@ fn main() {
     catnames.dedup();
     let cat_of: FxHashMap<&[u8], u16> = catnames.iter().enumerate().map(|(i, c)| (&c[..], i as u16)).collect();
     let unknown = cat_of[&b"unknown"[..]];
-    let prod_cat: FxHashMap<S, u16> = prods.iter().map(|r| (r[0], cat_of[r[1]])).collect();
+    let prod_cat: StrMap<u16> = StrMap::new(prods.iter().map(|r| (r[0], cat_of[r[1]])), u16::MAX);
     let camp_ids: Vec<Vec<u8>> = camps.iter().map(|r| r[0].to_vec()).collect();
     let camp_chan: Vec<Vec<u8>> = camps.iter().map(|r| r[1].to_vec()).collect();
-    let camp_of: FxHashMap<S, u16> = camps.iter().enumerate().map(|(i, r)| (r[0], i as u16)).collect();
+    let camp_of: StrMap<u16> = StrMap::new(camps.iter().enumerate().map(|(i, r)| (r[0], i as u16)), u16::MAX);
     let ncamp = camps.len();
     let organic = ncamp as u16;
 
@@ -947,12 +1043,12 @@ fn main() {
     log!(t0, "links: {} ids", people.n);
 
     // events: read + parse in parallel slices of each file
-    let ev_files = csv_files(&data.join("events"));
-    let ev_tasks = tasks_for(&ev_files);
-    let parsed: Vec<Vec<RawEv>> = ev_tasks
+    let ev_map = map_files(&data.join("events"));
+    let parsed: Vec<Vec<RawEv>> = ev_map
+        .tasks
         .par_iter()
         .map(|t| {
-            let c = read_task(&ev_files, t);
+            let c = task_lines(&ev_map, t);
             let mut v: Vec<RawEv> = Vec::with_capacity(c.len() / 70 + 16);
             parse_lines::<7>(c, |&[eid, uid, ts, its, et, pid, pr]| {
                 if eid.is_empty() {
@@ -975,14 +1071,14 @@ fn main() {
                     its: parse_ts(its),
                     ts: parse_ts(ts),
                     price: if kind == 2 { parse_price(pr) } else { 0 },
-                    cat: if kind < 3 { *prod_cat.get(pid).unwrap_or(&unknown) } else { 0 },
+                    cat: if kind < 3 { prod_cat.get(pid).unwrap_or(unknown) } else { 0 },
                     kind,
                 });
             });
             v
         })
         .collect();
-    log!(t0, "events read and parsed: {} slices", ev_tasks.len());
+    log!(t0, "events read and parsed: {} slices", ev_map.tasks.len());
     let (raw, dstarts) = scatter(parsed, DB, |e: &RawEv| (e.eh >> (64 - DB_BITS)) as usize);
     log!(t0, "events bucketed by id: {}", raw.len());
 
@@ -1003,7 +1099,7 @@ fn main() {
                         }
                         Some(&i) => {
                             let i = i as usize;
-                            if keep[i].eid == e.eid {
+                            if eq_bytes(keep[i].eid, e.eid) {
                                 if e.its < keep[i].its {
                                     keep[i] = *e;
                                 }
@@ -1045,18 +1141,18 @@ fn main() {
     log!(t0, "events bucketed by person: {}", evs_all.len());
 
     // clicks (copies are identical, so duplicates change nothing and need no dedup)
-    let cl_files = csv_files(&data.join("clicks"));
-    let cl_tasks = tasks_for(&cl_files);
-    let cl_parts: Vec<Vec<Click>> = cl_tasks
+    let cl_map = map_files(&data.join("clicks"));
+    let cl_parts: Vec<Vec<Click>> = cl_map
+        .tasks
         .par_iter()
         .map(|t| {
-            let c = read_task(&cl_files, t);
+            let c = task_lines(&cl_map, t);
             let mut v: Vec<Click> = Vec::with_capacity(c.len() / 45 + 16);
             parse_lines::<4>(c, |&[cid, uid, camp, ts]| {
                 if cid.is_empty() || uid.is_empty() {
                     return;
                 }
-                let Some(&ci) = camp_of.get(camp) else { return };
+                let Some(ci) = camp_of.get(camp) else { return };
                 let tm = parse_ts(ts);
                 if tm == BAD || tm < cws || tm >= we {
                     return;
@@ -1106,37 +1202,49 @@ fn main() {
             evs.sort_unstable_by(|a, b| a.ph.cmp(&b.ph).then(a.ts.cmp(&b.ts)));
             cls.sort_unstable_by(|a, b| a.ph.cmp(&b.ph).then(a.ts.cmp(&b.ts)).then(a.cid.cmp(b.cid)));
             // exactness guard: if two different names share a 64-bit hash, sort by name too
-            let same = |a: S, b: S| a.as_ptr() == b.as_ptr() && a.len() == b.len() || a == b;
+            let same = |a: S, b: S| eq_bytes(a, b);
             let collide_e = evs.windows(2).any(|w| w[0].ph == w[1].ph && !same(w[0].name, w[1].name));
             let collide_c = cls.windows(2).any(|w| w[0].ph == w[1].ph && !same(w[0].name, w[1].name));
-            if collide_e || collide_c {
+            let force = std::env::var_os("SHOP_EXACT").is_some();
+            if collide_e || collide_c || force {
                 evs.sort_unstable_by(|a, b| a.ph.cmp(&b.ph).then(a.name.cmp(b.name)).then(a.ts.cmp(&b.ts)));
                 cls.sort_unstable_by(|a, b| {
                     a.ph.cmp(&b.ph).then(a.name.cmp(b.name)).then(a.ts.cmp(&b.ts)).then(a.cid.cmp(b.cid))
                 });
             }
-            let exact = collide_e || collide_c;
+            let exact = collide_e || collide_c || force;
             acc.t_sort += tsort.elapsed().as_secs_f64();
             let tproc = Instant::now();
             // group key: the person hash, plus the name only when a hash collision was seen
-            let key_e = |e: &Ev| (e.ph, if exact { e.name } else { &[][..] });
-            let key_c = |c: &Click| (c.ph, if exact { c.name } else { &[][..] });
+            let cmp_e = |a: &Ev, ph: u64, nm: S| -> std::cmp::Ordering {
+                if !exact {
+                    a.ph.cmp(&ph)
+                } else {
+                    a.ph.cmp(&ph).then(a.name.cmp(nm))
+                }
+            };
+            let cmp_c = |c: &Click, ph: u64, nm: S| -> std::cmp::Ordering {
+                if !exact {
+                    c.ph.cmp(&ph)
+                } else {
+                    c.ph.cmp(&ph).then(c.name.cmp(nm))
+                }
+            };
 
             let Acc { rows, credit, assist, cnt, pos, active, catsum, touched, .. } = &mut acc;
-
             let mut ci = 0usize;
             let mut i = 0usize;
             while i < evs.len() {
-                let k = key_e(&evs[i]);
+                let (kph, knm) = (evs[i].ph, evs[i].name);
                 let mut gend = i + 1;
-                while gend < evs.len() && key_e(&evs[gend]) == k {
+                while gend < evs.len() && cmp_e(&evs[gend], kph, knm).is_eq() {
                     gend += 1;
                 }
-                while ci < cls.len() && key_c(&cls[ci]) < k {
+                while ci < cls.len() && cmp_c(&cls[ci], kph, knm).is_lt() {
                     ci += 1;
                 }
                 let cs = ci;
-                while ci < cls.len() && key_c(&cls[ci]) == k {
+                while ci < cls.len() && cmp_c(&cls[ci], kph, knm).is_eq() {
                     ci += 1;
                 }
                 let cl = &cls[cs..ci];
