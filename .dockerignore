@@ -1,0 +1,6 @@
+tests/
+fixtures/
+scripts/
+*.md
+.git
+Makefile
