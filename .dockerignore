@@ -1,6 +1,8 @@
 tests/
 fixtures/
 scripts/
+duckdb/
+target/
 *.md
 .git
 Makefile

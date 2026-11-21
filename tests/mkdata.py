@@ -136,7 +136,7 @@ R.shuffle(clicks)
 R.shuffle(links)
 
 
-def dump(sub, header, rows, nfiles):
+def dump(sub, header, rows, nfiles, no_cr=frozenset()):
     os.makedirs(os.path.join(out, sub), exist_ok=True)
     chunks = [[] for _ in range(nfiles)]
     for r in rows:
@@ -147,7 +147,7 @@ def dump(sub, header, rows, nfiles):
             for r in ch:
                 line = ",".join(q(v) for v in r)
                 x = R.random()
-                if x < 0.01 and not os.environ.get("NOCR"):
+                if x < 0.01 and not os.environ.get("NOCR") and r[0] not in no_cr:
                     line = line + "\r"
                 elif x < 0.015:
                     line = line + ",extra"
@@ -161,7 +161,9 @@ def dump(sub, header, rows, nfiles):
 
 
 dump("events", "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents", events, 4)
-dump("clicks", "click_id,user_id,campaign_id,ts", clicks, 3)
+from collections import Counter
+_dup = frozenset(k for k, n in Counter(c[0] for c in clicks).items() if n > 1)
+dump("clicks", "click_id,user_id,campaign_id,ts", clicks, 3, _dup)
 dump("links", "user_id_a,user_id_b", links, 3)
 with open(os.path.join(out, "products.csv"), "w") as f:
     f.write("product_id,category\n")
