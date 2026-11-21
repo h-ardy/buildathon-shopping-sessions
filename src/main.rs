@@ -20,7 +20,7 @@ const GAP: i64 = 1_800_000;
 const BAD: i64 = i64::MIN;
 const PB_BITS: u32 = 12;
 const PB: usize = 1 << PB_BITS; // person buckets
-const DB_BITS: u32 = 12;
+const DB_BITS: u32 = 8;
 const DB: usize = 1 << DB_BITS; // dedup buckets
 fn chunk_size() -> u64 {
     static C: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -715,11 +715,13 @@ struct Click {
 }
 
 #[derive(Clone, Copy)]
+#[repr(C, align(64))]
 struct PEntry {
     uh: u64,
-    id: S,
     ph: u64,
     name: S,
+    id: S,
+    key: [u8; 16], // first bytes of id, so most lookups never leave this cache line
 }
 
 /// Open-addressing table: linked user ID -> person (name and its hash). IDs not in it are their own person.
@@ -740,13 +742,46 @@ impl People {
                 if e.id.is_empty() {
                     break;
                 }
-                if e.uh == uh && eq_bytes(e.id, uid) {
-                    return (e.ph, e.name);
+                if e.uh == uh && e.id.len() == uid.len() {
+                    let n = uid.len();
+                    let same = if n <= 16 { eq_bytes(&e.key[..n], uid) } else { eq_bytes(e.id, uid) };
+                    if same {
+                        return (e.ph, e.name);
+                    }
                 }
                 i = (i + 1) & mask;
             }
         }
         (uh, uid)
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, uh: u64) {
+        #[cfg(target_arch = "x86_64")]
+        if self.n > 0 {
+            let i = (uh >> self.shift) as usize;
+            unsafe {
+                std::arch::x86_64::_mm_prefetch(self.tab.as_ptr().add(i) as *const i8, std::arch::x86_64::_MM_HINT_T0)
+            };
+        }
+    }
+
+    /// Resolve in place: on entry each item's (hash, name) holds the user ID's (hash, bytes).
+    /// Table slots are prefetched a few items ahead so the cache misses overlap.
+    fn resolve_all<T>(&self, v: &mut [T], get: impl Fn(&T) -> (u64, S), set: impl Fn(&mut T, u64, S)) {
+        const AHEAD: usize = 16;
+        let n = v.len();
+        for i in 0..n.min(AHEAD) {
+            self.prefetch(get(&v[i]).0);
+        }
+        for i in 0..n {
+            if i + AHEAD < n {
+                self.prefetch(get(&v[i + AHEAD]).0);
+            }
+            let (uh, uid) = get(&v[i]);
+            let (ph, name) = self.resolve(uh, uid);
+            set(&mut v[i], ph, name);
+        }
     }
 }
 
@@ -864,12 +899,15 @@ fn build_people(data: &Path) -> People {
         .into_par_iter()
         .map(|i| {
             let name = names[best[roots[i] as usize] as usize];
-            PEntry { uh: hash_bytes(names[i]), id: names[i], ph: hash_bytes(name), name }
+            let mut key = [0u8; 16];
+            let k = names[i].len().min(16);
+            key[..k].copy_from_slice(&names[i][..k]);
+            PEntry { uh: hash_bytes(names[i]), ph: hash_bytes(name), name, id: names[i], key }
         })
         .collect();
     let cap = (n * 2).next_power_of_two().max(2);
     let bits = cap.trailing_zeros();
-    let mut tab = vec![PEntry { uh: 0, id: &[], ph: 0, name: &[] }; cap];
+    let mut tab = vec![PEntry { uh: 0, ph: 0, name: &[], id: &[], key: [0; 16] }; cap];
     let shift = 64 - bits;
     for e in entries {
         let mut i = (e.uh >> shift) as usize;
@@ -1042,14 +1080,87 @@ fn main() {
     let people = build_people(&data);
     log!(t0, "links: {} ids", people.n);
 
-    // events: read + parse in parallel slices of each file
+    // events: memory-mapped, parsed in parallel slices of each file
     let ev_map = map_files(&data.join("events"));
-    let parsed: Vec<Vec<RawEv>> = ev_map
+
+    // pass 1: hash every event_id (first field only) to learn which ids occur more than once
+    let id_parts: Vec<Vec<Vec<u64>>> = ev_map
         .tasks
         .par_iter()
         .map(|t| {
             let c = task_lines(&ev_map, t);
-            let mut v: Vec<RawEv> = Vec::with_capacity(c.len() / 70 + 16);
+            let per = c.len() / 70 / DB * 5 / 4;
+            let mut v: Vec<Vec<u64>> = (0..DB).map(|_| Vec::with_capacity(per)).collect();
+            for_lines(c, |l| {
+                let f = match memchr(b',', l) {
+                    Some(i) => &l[..i],
+                    None => l,
+                };
+                // same unquoting as the full parser for any line it accepts
+                let f = if f.len() >= 2 && f[0] == b'"' && f[f.len() - 1] == b'"' { &f[1..f.len() - 1] } else { f };
+                if f.is_empty() {
+                    return;
+                }
+                let eh = hash_bytes(f);
+                v[(eh >> (64 - DB_BITS)) as usize].push(eh);
+            });
+            v
+        })
+        .collect();
+    let id_parts = &id_parts;
+    let dups: Vec<Vec<u64>> = (0..DB)
+        .into_par_iter()
+        .map(|b| {
+            let n: usize = id_parts.iter().map(|t| t[b].len()).sum();
+            let mut seen: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::with_capacity_and_hasher(n, Default::default());
+            let mut d = Vec::new();
+            for &h in id_parts.iter().flat_map(|t| t[b].iter()) {
+                if !seen.insert(h) {
+                    d.push(h);
+                }
+            }
+            d
+        })
+        .collect();
+    let ndup: usize = dups.iter().map(|d| d.len()).sum();
+    let dbits_log = ((ndup.max(1) * 16).next_power_of_two().trailing_zeros()).clamp(16, 34);
+    let mut dbits = vec![0u64; (1usize << dbits_log) / 64];
+    for d in &dups {
+        for &h in d {
+            let i = (h >> (64 - dbits_log)) as usize;
+            dbits[i >> 6] |= 1u64 << (i & 63);
+        }
+    }
+    let dbits = &dbits;
+    let maybe_dup = |eh: u64| -> bool {
+        let i = (eh >> (64 - dbits_log)) as usize;
+        dbits[i >> 6] >> (i & 63) & 1 != 0
+    };
+    log!(t0, "events pass 1: {} repeated ids", ndup);
+
+    // validate a kept copy and resolve its person
+    let to_ev = |e: &RawEv| -> Option<Ev> {
+        if e.uid.is_empty() || e.kind > 2 || e.ts == BAD || e.ts < ws || e.ts >= we {
+            return None;
+        }
+        if e.kind == 2 && e.price < 0 {
+            return None;
+        }
+        if e.its - e.ts > DAY {
+            return None;
+        }
+        // person resolved later in batches: carry the user id's hash and bytes for now
+        Some(Ev { ph: e.uh, name: e.uid, ts: e.ts, price: e.price, cat: e.cat, purchase: e.kind == 2 })
+    };
+
+    // pass 2: full parse. Events whose id occurs once are final right away; the rest go to exact dedup.
+    let pass2: Vec<(Vec<Ev>, Vec<Vec<RawEv>>)> = ev_map
+        .tasks
+        .par_iter()
+        .map(|t| {
+            let c = task_lines(&ev_map, t);
+            let mut out: Vec<Ev> = Vec::with_capacity(c.len() / 75 + 16);
+            let mut dv: Vec<Vec<RawEv>> = (0..DB).map(|_| Vec::new()).collect();
             parse_lines::<7>(c, |&[eid, uid, ts, its, et, pid, pr]| {
                 if eid.is_empty() {
                     return;
@@ -1063,8 +1174,9 @@ fn main() {
                 if pid.is_empty() {
                     kind = 4;
                 }
-                v.push(RawEv {
-                    eh: hash_bytes(eid),
+                let eh = hash_bytes(eid);
+                let e = RawEv {
+                    eh,
                     eid,
                     uid,
                     uh: hash_bytes(uid),
@@ -1073,25 +1185,33 @@ fn main() {
                     price: if kind == 2 { parse_price(pr) } else { 0 },
                     cat: if kind < 3 { prod_cat.get(pid).unwrap_or(unknown) } else { 0 },
                     kind,
-                });
+                };
+                if maybe_dup(eh) {
+                    dv[(eh >> (64 - DB_BITS)) as usize].push(e);
+                } else if let Some(v) = to_ev(&e) {
+                    out.push(v);
+                }
             });
-            v
+            people.resolve_all(&mut out, |e: &Ev| (e.ph, e.name), |e: &mut Ev, ph, name| {
+                e.ph = ph;
+                e.name = name;
+            });
+            (out, dv)
         })
         .collect();
-    log!(t0, "events read and parsed: {} slices", ev_map.tasks.len());
-    let (raw, dstarts) = scatter(parsed, DB, |e: &RawEv| (e.eh >> (64 - DB_BITS)) as usize);
-    log!(t0, "events bucketed by id: {}", raw.len());
+    log!(t0, "events pass 2 parsed: {} slices", ev_map.tasks.len());
 
-    // dedup each bucket (earliest ingest_ts wins), then validate the kept copy and resolve its person
-    let ev_parts: Vec<Vec<Ev>> = dstarts
-        .par_windows(2)
-        .with_min_len(16)
+    // exact dedup of repeated ids (earliest ingest_ts wins), then validate the kept copy
+    let pass2 = pass2;
+    let dedup_out: Vec<Vec<Ev>> = (0..DB)
+        .into_par_iter()
+        .with_min_len(4)
         .fold(
             || (Vec::<Ev>::new(), FxHashMap::<u64, u32>::default(), Vec::<RawEv>::new()),
-            |(mut out, mut seen, mut keep), w| {
+            |(mut out, mut seen, mut keep), b| {
                 seen.clear();
                 keep.clear();
-                for e in &raw[w[0]..w[1]] {
+                for e in pass2.iter().flat_map(|t| t.1[b].iter()) {
                     match seen.get(&e.eh) {
                         None => {
                             seen.insert(e.eh, keep.len() as u32);
@@ -1117,25 +1237,26 @@ fn main() {
                         }
                     }
                 }
+                let before = out.len();
                 for e in &keep {
-                    if e.uid.is_empty() || e.kind > 2 || e.ts == BAD || e.ts < ws || e.ts >= we {
-                        continue;
+                    if let Some(v) = to_ev(e) {
+                        out.push(v);
                     }
-                    if e.kind == 2 && e.price < 0 {
-                        continue;
-                    }
-                    if e.its - e.ts > DAY {
-                        continue;
-                    }
-                    let (ph, name) = people.resolve(e.uh, e.uid);
-                    out.push(Ev { ph, name, ts: e.ts, price: e.price, cat: e.cat, purchase: e.kind == 2 });
                 }
+                people.resolve_all(&mut out[before..], |e: &Ev| (e.ph, e.name), |e: &mut Ev, ph, name| {
+                    e.ph = ph;
+                    e.name = name;
+                });
                 (out, seen, keep)
             },
         )
         .map(|(out, _, _)| out)
         .collect();
-    drop(raw);
+    let mut ev_parts: Vec<Vec<Ev>> = Vec::with_capacity(pass2.len() + dedup_out.len());
+    for (o, _) in pass2 {
+        ev_parts.push(o);
+    }
+    ev_parts.extend(dedup_out);
     log!(t0, "events deduped and cleaned");
     let (mut evs_all, estarts) = scatter(ev_parts, PB, |e: &Ev| pbucket(e.ph));
     log!(t0, "events bucketed by person: {}", evs_all.len());
@@ -1157,8 +1278,11 @@ fn main() {
                 if tm == BAD || tm < cws || tm >= we {
                     return;
                 }
-                let (ph, name) = people.resolve(hash_bytes(uid), uid);
-                v.push(Click { ph, name, ts: tm, cid, camp: ci });
+                v.push(Click { ph: hash_bytes(uid), name: uid, ts: tm, cid, camp: ci });
+            });
+            people.resolve_all(&mut v, |c: &Click| (c.ph, c.name), |c: &mut Click, ph, name| {
+                c.ph = ph;
+                c.name = name;
             });
             v
         })
