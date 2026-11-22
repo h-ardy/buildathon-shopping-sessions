@@ -1264,6 +1264,8 @@ fn write_campaign(path: &Path, ids: &[Vec<u8>], chans: &[Vec<u8>], days: &[i32],
 // ---------------- per-person stage ----------------
 
 struct Ctx {
+    ws: i64,
+    radix_ok: bool, // event times fit 32 bits after subtracting ws
     ndays: usize,
     ws_day: i64,
     organic: u16,
@@ -1288,6 +1290,8 @@ struct Acc {
     ev_id: Vec<u32>,
     cl_id: Vec<u32>,
     ev_tmp: Vec<Ev>,
+    rk: Vec<u64>,
+    rk2: Vec<u64>,
     cl_tmp: Vec<Click>,
 }
 
@@ -1311,6 +1315,8 @@ impl Acc {
             ev_id: Vec::new(),
             cl_id: Vec::new(),
             ev_tmp: Vec::new(),
+            rk: Vec::new(),
+            rk2: Vec::new(),
             cl_tmp: Vec::new(),
         }
     }
@@ -1424,6 +1430,43 @@ fn process_person(acc: &mut Acc, ev: &[Ev], cl: &[Click], gname: Name, cx: &Ctx)
     active.clear();
 }
 
+/// LSD radix sort of u64 keys by their high 32 bits (8 bits per pass; a pass whose digit is the same
+/// for every key is skipped). Stable, so equal high halves keep their order.
+fn radix_hi32(v: &mut Vec<u64>, tmp: &mut Vec<u64>) {
+    let n = v.len();
+    let mut cnt = [[0u32; 256]; 4];
+    for &k in v.iter() {
+        let h = (k >> 32) as u32;
+        cnt[0][(h & 255) as usize] += 1;
+        cnt[1][(h >> 8 & 255) as usize] += 1;
+        cnt[2][(h >> 16 & 255) as usize] += 1;
+        cnt[3][(h >> 24) as usize] += 1;
+    }
+    tmp.clear();
+    tmp.reserve(n);
+    for d in 0..4 {
+        let c = &mut cnt[d];
+        if c.iter().any(|&x| x as usize == n) {
+            continue;
+        }
+        let mut s = 0u32;
+        for x in c.iter_mut() {
+            let t = *x;
+            *x = s;
+            s += t;
+        }
+        let sh = 32 + 8 * d as u32;
+        let dst = tmp.as_mut_ptr();
+        for &k in v.iter() {
+            let b = (k >> sh & 255) as usize;
+            unsafe { dst.add(c[b] as usize).write(k) };
+            c[b] += 1;
+        }
+        unsafe { tmp.set_len(n) };
+        std::mem::swap(v, tmp);
+    }
+}
+
 #[inline]
 fn sort_clicks(c: &mut [Click]) {
     c.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.cid.cmp(b.cid)));
@@ -1520,12 +1563,28 @@ fn group_bucket(acc: &mut Acc, evs: &[Ev], cls: &[Click], cx: &Ctx) -> bool {
     acc.ev_tmp.reserve(n);
     acc.cl_tmp.clear();
     acc.cl_tmp.reserve(sc as usize);
+    let presorted = cx.radix_ok && n < (1 << 32);
     {
         let mut w = eoff.clone();
         let dst = acc.ev_tmp.as_mut_ptr();
-        for (e, &id) in evs.iter().zip(&acc.ev_id) {
-            unsafe { dst.add(w[id as usize] as usize).write(*e) };
-            w[id as usize] += 1;
+        if presorted {
+            // radix sort the bucket by time (keys: time offset, position), then place by person:
+            // each person's events come out already in time order
+            let (rk, rk2) = (&mut acc.rk, &mut acc.rk2);
+            rk.clear();
+            rk.extend(evs.iter().enumerate().map(|(i, e)| ((e.ts - cx.ws) as u64) << 32 | i as u64));
+            radix_hi32(rk, rk2);
+            for &k in rk.iter() {
+                let i = (k & 0xFFFF_FFFF) as usize;
+                let id = acc.ev_id[i] as usize;
+                unsafe { dst.add(w[id] as usize).write(*evs.get_unchecked(i)) };
+                w[id] += 1;
+            }
+        } else {
+            for (e, &id) in evs.iter().zip(&acc.ev_id) {
+                unsafe { dst.add(w[id as usize] as usize).write(*e) };
+                w[id as usize] += 1;
+            }
         }
         unsafe { acc.ev_tmp.set_len(n) };
         let mut w = coff.clone();
@@ -1543,7 +1602,9 @@ fn group_bucket(acc: &mut Acc, evs: &[Ev], cls: &[Click], cx: &Ctx) -> bool {
     let mut cl_tmp = std::mem::take(&mut acc.cl_tmp);
     for p in 0..np {
         let ev = &mut ev_tmp[eoff[p] as usize..eoff[p + 1] as usize];
-        ev.sort_unstable_by_key(|e| e.ts);
+        if !presorted {
+            ev.sort_unstable_by_key(|e| e.ts);
+        }
         let cl = &mut cl_tmp[coff[p] as usize..coff[p + 1] as usize];
         sort_clicks(cl);
         let name = acc.p_name[p];
@@ -1918,7 +1979,7 @@ fn main() {
 
     let ncat = catnames.len();
     let force_exact = std::env::var_os("SHOP_EXACT").is_some();
-    let ctx = Ctx { ndays, ws_day, organic };
+    let ctx = Ctx { ws, radix_ok: (we - ws) < (1i64 << 32) && std::env::var_os("SHOP_NORADIX").is_none(), ndays, ws_day, organic };
     let ev_slices = split_mut(&mut evs_all, &estarts);
     let cl_slices = split_mut(&mut cls_all, &cstarts);
     let results: Vec<Acc> = ev_slices
@@ -1983,6 +2044,44 @@ fn main() {
     });
     let hwm = std::fs::read_to_string("/proc/self/status").ok().and_then(|st| st.lines().find(|l| l.starts_with("VmHWM")).map(|l| l.to_string())).unwrap_or_default();
     log!(t0, "written: {} user rows, {} campaign rows; peak memory {}", all.len(), ids.len(), hwm.trim());
+    if std::env::var_os("SHOP_NOTEAR").is_none() {
+        // Give the big buffers and input mappings back to the kernel on all threads, in pieces, instead
+        // of leaving the whole teardown to the single exiting thread.
+        let nrows = all.len();
+        drop(groups);
+        drop(all);
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut take = |p: *const u8, len: usize| {
+            if len >= BIG {
+                spans.push((p as usize, len));
+            }
+        };
+        take(evs_all.as_ptr() as *const u8, evs_all.capacity() * std::mem::size_of::<Ev>());
+        take(cls_all.as_ptr() as *const u8, cls_all.capacity() * std::mem::size_of::<Click>());
+        for f in &ev_map.files {
+            take(f.as_ptr(), f.len());
+        }
+        std::mem::forget(evs_all);
+        std::mem::forget(cls_all);
+        let page = 4096usize;
+        let mut pieces: Vec<(usize, usize)> = Vec::new();
+        for (p, len) in spans {
+            let start = (p + page - 1) & !(page - 1);
+            let end = (p + len) & !(page - 1);
+            let mut a = start;
+            while a < end {
+                let b = (a + (32 << 20)).min(end);
+                pieces.push((a, b - a));
+                a = b;
+            }
+        }
+        pieces.par_iter().for_each(|&(a, l)| unsafe {
+            libc::munmap(a as *mut libc::c_void, l);
+        });
+        drop(results);
+        drop(people);
+        log!(t0, "memory returned ({} rows)", nrows);
+    }
     eprintln!("DIAG done; failing on purpose so the scorer returns these logs");
     std::process::exit(3);
 }
