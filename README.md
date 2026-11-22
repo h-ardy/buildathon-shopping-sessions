@@ -10,7 +10,7 @@ A native Rust pipeline that reads the dirty click-stream CSVs in `/data` and wri
 4. Events, in two passes. Pass 1 hashes only each line's `event_id` and finds the ids that occur more than once. Pass 2 parses fully: an event whose id occurs once is validated (window, type, product, price, late cutoff) and kept right away. The few repeated ids go to an exact dedup that keeps the copy with the earliest `ingest_ts`, compares ids byte for byte, and only then validates. Events wait in batches of 32 so the duplicate-id bit lookups are prefetched, and person lookups run in batches with the table slots prefetched ahead, so their cache misses overlap.
 Clicks are parsed and bucketed while the events go through pass 2, dedup and bucketing, again so the two phases fill each other's serial steps.
 5. Sessions, credit and assists. Events and clicks are bucketed by a hash of the person; inside a bucket a small hash table groups them per person, and each person's events are sorted by time. One pass per person builds the sessions, credits each session to the latest click within 7 days (smallest `click_id` on ties), and keeps a sliding 7-day window of campaign counts for assists.
-6. Output. `campaign_daily` is one file. `user_daily` is written as several files in parallel, with all user IDs of a file in one shared buffer instead of one allocation per row. The columns are encoded compactly (delta-encoded user IDs, which costs a repeat of the same person a couple of bytes; dictionaries for the small-valued columns; delta bit-packed revenue), so the output is about a fifth of the PLAIN size. That matters because the run is timed until the files are written (`SHOP_PLAIN_OUT=1` writes PLAIN pages).
+6. Output. `campaign_daily` is one file. `user_daily` is written as several files in parallel, with all user IDs of a file in one shared buffer instead of one allocation per row. Before exiting, the large buffers and input mappings are unmapped in pieces on all threads rather than left to the exiting thread.
 
 Large buffers are mapped directly with `mmap` and ask for transparent huge pages (`SHOP_ALLOC=0` turns that off), and keys are compared inline rather than through library calls. User and person IDs of up to 15 bytes are kept inline in each record, so grouping never reads back into the input files. Per-person grouping compares only the 64-bit person hash, and falls back to comparing names if two different names ever share a hash (`SHOP_EXACT=1` forces that path for testing).
 
@@ -24,6 +24,11 @@ Large buffers are mapped directly with `mmap` and ask for transparent huge pages
 ## Third-party code
 
 Crates `parquet`, `rayon`, `memchr`, `rustc-hash` and `libc` (versions pinned in `Cargo.lock`). DuckDB, NumPy, SciPy and PyArrow for the DuckDB version and the tests. `Makefile`, `scripts/` and `fixtures/` come from the organizers' DuckDB starter. No code was written before the event.
+
+
+## Ideas from other public entries
+
+Two ideas here came from reading other teams' public, MIT-licensed READMEs during the event; the code is our own. Sorting a person bucket by time with a radix sort and then placing events stably by person follows the description in ks129/shopping-sessions (team ks123). Returning memory on all threads before exit follows EvanDamron/shopping-sessions (team Kentucky Fried Evan).
 
 ## License
 
